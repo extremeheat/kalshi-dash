@@ -3,22 +3,28 @@ import { toDate } from 'date-fns-tz';
 
 // ============ CSV FORMAT DETECTION ============
 
-export type CsvFormat = 'legacy' | 'new';
+export type CsvFormat = 'legacy' | 'new' | 'new_fp';
 
-// New format columns (2025+)
+// New format columns with dollars (current format)
+const NEW_FORMAT_FP_COLUMNS = ['type', 'quantity_fp', 'market_ticker', 'side', 'entry_price_dollars', 'exit_price_dollars', 'open_fees_dollars', 'close_fees_dollars', 'realized_pnl_without_fees_dollars', 'realized_pnl_with_fees_dollars', 'close_timestamp', 'open_timestamp'];
+
+// New format columns with cents (older 2025 format)
 const NEW_FORMAT_COLUMNS = ['type', 'quantity', 'market_ticker', 'side', 'entry_price_cents', 'exit_price_cents', 'open_fees_cents', 'close_fees_cents', 'realized_pnl_without_fees_cents', 'realized_pnl_with_fees_cents', 'close_timestamp', 'open_timestamp'];
 
 // Legacy format columns
 const LEGACY_FORMAT_COLUMNS = ['Ticker', 'Type', 'Direction', 'Contracts', 'Average_Price', 'Created'];
 
 export const detectCsvFormat = (headers: string[]): CsvFormat => {
+  const hasNewFpFormat = NEW_FORMAT_FP_COLUMNS.every(col => headers.includes(col));
+  if (hasNewFpFormat) return 'new_fp';
+
   const hasNewFormat = NEW_FORMAT_COLUMNS.every(col => headers.includes(col));
   if (hasNewFormat) return 'new';
   
   const hasLegacyFormat = LEGACY_FORMAT_COLUMNS.every(col => headers.includes(col));
   if (hasLegacyFormat) return 'legacy';
   
-  throw new Error(`Unrecognized CSV format. Expected columns for either new format (${NEW_FORMAT_COLUMNS.slice(0, 3).join(', ')}...) or legacy format (${LEGACY_FORMAT_COLUMNS.join(', ')})`);
+  throw new Error(`Unrecognized CSV format. Supported formats: current (${NEW_FORMAT_FP_COLUMNS.slice(0, 3).join(', ')}...), older cents-based (${NEW_FORMAT_COLUMNS.slice(0, 3).join(', ')}...), or legacy (${LEGACY_FORMAT_COLUMNS.join(', ')})`);
 };
 
 // ============ INTERFACES ============
@@ -709,6 +715,122 @@ const calculateBasicStatsFromMatchedTrades = (matchedTrades: MatchedTrade[]): Pr
   };
 };
 
+// ============ NEW FP FORMAT PARSER (current format with dollars) ============
+
+interface NewFormatFPRow {
+  type: string;
+  quantity_fp: string;
+  market_ticker: string;
+  side: string;
+  entry_price_dollars: string;
+  exit_price_dollars: string;
+  open_fees_dollars: string;
+  close_fees_dollars: string;
+  realized_pnl_without_fees_dollars: string;
+  realized_pnl_with_fees_dollars: string;
+  close_timestamp: string;
+  open_timestamp: string;
+}
+
+const processNewFormatFP = (rawData: NewFormatFPRow[]): { trades: Trade[], matchedTrades: MatchedTrade[] } => {
+  const trades: Trade[] = [];
+  const matchedTrades: MatchedTrade[] = [];
+  let skippedRows = 0;
+
+  rawData.forEach((row, index) => {
+    try {
+      if (!row.market_ticker || row.type !== 'trade') return;
+
+      // Skip rows with missing timestamps
+      if (!row.open_timestamp || !row.close_timestamp) {
+        skippedRows++;
+        return;
+      }
+
+      const quantity = parseFloat(row.quantity_fp) || 0;
+      if (quantity === 0) return; // Skip zero quantity trades
+
+      // Dollar values — convert prices to cents (0–100) for internal consistency
+      const entryPrice = Math.round((parseFloat(row.entry_price_dollars) || 0) * 100);
+      const exitPrice = Math.round((parseFloat(row.exit_price_dollars) || 0) * 100);
+      const openFees = parseFloat(row.open_fees_dollars) || 0;
+      const closeFees = parseFloat(row.close_fees_dollars) || 0;
+      const pnlWithFees = parseFloat(row.realized_pnl_with_fees_dollars) || 0;
+      const pnlWithoutFees = parseFloat(row.realized_pnl_without_fees_dollars) || 0;
+      const totalFees = openFees + closeFees;
+
+      const entryDate = new Date(row.open_timestamp);
+      const exitDate = new Date(row.close_timestamp);
+
+      // Validate dates
+      if (isNaN(entryDate.getTime()) || isNaN(exitDate.getTime())) {
+        skippedRows++;
+        console.warn(`Skipping row ${index}: Invalid date - open: "${row.open_timestamp}", close: "${row.close_timestamp}"`);
+        return;
+      }
+
+      // Validate and normalize direction
+      const side = row.side?.toLowerCase();
+      if (side !== 'yes' && side !== 'no') {
+        skippedRows++;
+        return;
+      }
+      const direction = side === 'yes' ? 'Yes' : 'No';
+
+      // Determine exit type based on exit price (0 or 100 cents = settlement, otherwise trade)
+      const exitType = (exitPrice === 0 || exitPrice === 100) ? 'settlement' : 'trade';
+
+      // entryCost in dollars: (quantity * entryPrice_cents) / 100
+      const entryCost = (quantity * entryPrice) / 100;
+      const trade: Trade = {
+        Ticker: row.market_ticker,
+        Type: exitType,
+        Direction: direction,
+        Contracts: quantity,
+        Average_Price: entryPrice,
+        Realized_Revenue: exitType === 'settlement' ? (exitPrice === 100 ? quantity : 0) : quantity,
+        Realized_Cost: entryCost,
+        Realized_Profit: pnlWithFees,
+        Fees: totalFees,
+        Created: row.close_timestamp,
+        Date: exitDate,
+        Trade_Cost: entryCost,
+      };
+      trades.push(trade);
+
+      // Create MatchedTrade directly (no FIFO matching needed)
+      const holdingDays = (exitDate.getTime() - entryDate.getTime()) / (24 * 3600 * 1000);
+      const matchedTrade: MatchedTrade = {
+        Ticker: row.market_ticker,
+        Entry_Date: entryDate,
+        Exit_Date: exitDate,
+        Entry_Direction: direction,
+        Exit_Type: exitType,
+        Contracts: quantity,
+        Entry_Cost: entryCost,
+        Realized_Profit: pnlWithoutFees,
+        Net_Profit: pnlWithFees,
+        Holding_Period_Days: holdingDays,
+        ROI: entryCost > 0 ? pnlWithFees / entryCost : 0,
+        Entry_Fee: openFees,
+        Exit_Fee: closeFees,
+        Total_Fees: totalFees,
+        Entry_Price: entryPrice,
+        Exit_Price: exitPrice,
+      };
+      matchedTrades.push(matchedTrade);
+
+    } catch (error) {
+      console.error("Error processing new FP format row:", row, error);
+      skippedRows++;
+    }
+  });
+
+  console.log(`New FP format processing: ${matchedTrades.length} trades processed, ${skippedRows} rows skipped`);
+
+  return { trades, matchedTrades };
+};
+
 // ============ LEGACY FORMAT PARSER ============
 
 const processLegacyFormat = (rawData: any[]): { trades: Trade[], matchedTrades: MatchedTrade[] } => {
@@ -771,7 +893,12 @@ export const processCSVData = (results: any): ProcessedData => {
     let matchedTrades: MatchedTrade[];
     let basicStats: ProcessedData['basicStats'];
     
-    if (format === 'new') {
+    if (format === 'new_fp') {
+      const processed = processNewFormatFP(rawData);
+      trades = processed.trades;
+      matchedTrades = processed.matchedTrades;
+      basicStats = calculateBasicStatsFromMatchedTrades(matchedTrades);
+    } else if (format === 'new') {
       const processed = processNewFormat(rawData);
       trades = processed.trades;
       matchedTrades = processed.matchedTrades;
