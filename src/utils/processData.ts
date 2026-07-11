@@ -24,7 +24,7 @@ export const detectCsvFormat = (headers: string[]): CsvFormat => {
   const hasLegacyFormat = LEGACY_FORMAT_COLUMNS.every(col => headers.includes(col));
   if (hasLegacyFormat) return 'legacy';
   
-  throw new Error(`Unrecognized CSV format. Expected columns for either new format (${NEW_FORMAT_FP_COLUMNS.slice(0, 3).join(', ')}...) or legacy format (${LEGACY_FORMAT_COLUMNS.join(', ')})`);
+  throw new Error(`Unrecognized CSV format. Supported formats: current (${NEW_FORMAT_FP_COLUMNS.slice(0, 3).join(', ')}...), older cents-based (${NEW_FORMAT_COLUMNS.slice(0, 3).join(', ')}...), or legacy (${LEGACY_FORMAT_COLUMNS.join(', ')})`);
 };
 
 // ============ INTERFACES ============
